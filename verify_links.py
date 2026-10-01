@@ -9,47 +9,28 @@ import subprocess
 import datetime
 from typing import List, Dict, Set, Optional, Tuple
 from urllib.parse import urlparse
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
 
-# --- CONFIGURATION ---
-SPREADSHEET_ID = "10drtwlduGC1-5V1yNYFNtvBTfHM4Klre25Kzfbmirxw"
-
-DEFAULT_SHEET_NAME = "Current Site Pages & New Site Pages"
-
-DEFAULT_START_ROW = 26
-
-DEFAULT_BATCH_SIZE = 10
+from common import (
+    SPREADSHEET_ID,
+    DEFAULT_SHEET_NAME,
+    DEFAULT_START_ROW,
+    LAST_ROW_TO_CHECK,
+    DEFAULT_BATCH_SIZE,
+    JEKYLL_PROJECT_DIR,
+    CONTENT_FOLDERS,
+    SCOPES,
+    ROWS_TO_SKIP,
+    get_latest_agy_conversation_id,
+    get_services,
+    get_resolved_sheet_name,
+    extract_doc_id,
+    normalize_url_path,
+    get_target_directories,
+    find_matching_jekyll_file,
+)
 
 # State persistence file
 PROGRESS_FILE = "progress.json"
-
-JEKYLL_PROJECT_DIR = r"D:\projects\document-verify\manektech-2026-jekyll"
-
-CONTENT_FOLDERS = [
-    "_services",
-    "_technologies",
-    "_solutions",
-    "_industries",
-    "_pages",
-    "_work",
-    "_blogposts",
-    "_ebooks",
-    "_events",
-    "_podcast",
-    "_tutorials",
-    "_whitepapers",
-]
-
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.readonly",
-    "https://www.googleapis.com/auth/documents.readonly"
-]
-
-ROWS_TO_SKIP = [137, 138, 139, 140, 141]
 
 # --- PROGRESS & STATE MANAGEMENT ---
 
@@ -84,85 +65,6 @@ def reset_progress():
             os.remove(PROGRESS_FILE)
         except Exception:
             pass
-
-def get_latest_agy_conversation_id() -> Optional[str]:
-    """Finds the most recent conversation ID created by agy CLI."""
-    conv_dir = os.path.expanduser(r"~/.gemini/antigravity-cli/conversations")
-    if os.path.isdir(conv_dir):
-        try:
-            files = [
-                os.path.join(conv_dir, f)
-                for f in os.listdir(conv_dir)
-                if f.endswith(".db") or f.endswith(".pb")
-            ]
-            if files:
-                files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-                base = os.path.basename(files[0])
-                m = re.match(r"^([a-f0-9-]{36})", base)
-                if m:
-                    return m.group(1)
-        except Exception:
-            pass
-    return None
-
-# --- GOOGLE API SERVICES ---
-
-def get_services():
-    """Authenticates and initializes Google Sheets, Drive, and Docs client services."""
-    creds = None
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open("token.json", "w") as token:
-            token.write(creds.to_json())
-
-    sheets_service = build("sheets", "v4", credentials=creds)
-    drive_service = build("drive", "v3", credentials=creds)
-    docs_service = build("docs", "v1", credentials=creds)
-    return sheets_service, drive_service, docs_service
-
-def get_resolved_sheet_name(sheets_service, spreadsheet_id: str, preferred: str = DEFAULT_SHEET_NAME) -> str:
-    """Finds the actual tab title in the spreadsheet that matches the preferred name."""
-    try:
-        meta = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-        sheets = meta.get("sheets", [])
-        titles = [s.get("properties", {}).get("title", "") for s in sheets]
-
-        # 1. Exact match
-        for t in titles:
-            if t == preferred:
-                return t
-
-        # 2. Case-insensitive match
-        for t in titles:
-            if t.lower() == preferred.lower():
-                return t
-
-        # 3. Substring match (e.g. "Current Site Pages & New Site Pages")
-        clean_preferred = preferred.lstrip("1234567890. ").strip().lower()
-        for t in titles:
-            if clean_preferred in t.lower():
-                return t
-
-        # 4. Fallback to first tab if none matched
-        if titles:
-            return titles[0]
-    except Exception as e:
-        print(f"⚠️ Could not inspect spreadsheet metadata: {e}")
-
-    return preferred
-
-def extract_doc_id(url: str) -> Optional[str]:
-    if not url:
-        return None
-    match = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
-    return match.group(1) if match else None
 
 def get_doc_links_and_md(docs_service, drive_service, doc_id: str, live_url: str = "", old_url: str = ""):
     """
@@ -222,23 +124,6 @@ def get_doc_links_and_md(docs_service, drive_service, doc_id: str, live_url: str
 
 # --- JEKYLL CONTENT MATCHING ---
 
-def get_target_directories(jekyll_dir: str = JEKYLL_PROJECT_DIR, folders: Optional[List[str]] = None) -> List[str]:
-    """Returns a list of existing directories to search for Jekyll content files."""
-    active_folders = folders if folders is not None else CONTENT_FOLDERS
-    target_dirs = []
-
-    if active_folders:
-        for folder in active_folders:
-            folder_path = folder if os.path.isabs(folder) else os.path.join(jekyll_dir, folder)
-            if os.path.isdir(folder_path):
-                target_dirs.append(folder_path)
-
-    # Fallback to base jekyll directory if none of the specific folders exist
-    if not target_dirs and os.path.isdir(jekyll_dir):
-        target_dirs.append(jekyll_dir)
-
-    return target_dirs
-
 def extract_jekyll_links(filepath: str) -> Set[str]:
     """Extracts all markdown, raw URLs, and YAML link attributes from a Jekyll file."""
     with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
@@ -259,18 +144,6 @@ def extract_jekyll_links(filepath: str) -> Set[str]:
 
     return links
 
-def normalize_url_path(url: str) -> str:
-    """Extracts lowercase stripped path from a URL (e.g., 'https://domain.com/path/' -> '/path')."""
-    if not url:
-        return ""
-    if url.startswith("http://") or url.startswith("https://"):
-        parsed = urlparse(url)
-        path = parsed.path.rstrip("/")
-        return path.lower()
-    path = url.split("?")[0].split("#")[0].rstrip("/")
-    if not path.startswith("/") and not path.startswith("http"):
-        path = "/" + path
-    return path.lower()
 
 def is_link_present(doc_url: str, jekyll_links: Set[str]) -> bool:
     """Checks if a Google Doc URL is present in the extracted Jekyll links (supports absolute & relative paths)."""
@@ -288,78 +161,6 @@ def is_link_present(doc_url: str, jekyll_links: Set[str]) -> bool:
 
     return False
 
-def find_matching_jekyll_file(
-    page_name: str,
-    live_url: str,
-    jekyll_dir: str = JEKYLL_PROJECT_DIR,
-    folders: Optional[List[str]] = None
-) -> Optional[str]:
-    """
-    Finds the local .md file across target Jekyll content folders based on:
-    1. Direct file name match ({slug}.md)
-    2. File name substring
-    3. Front matter permalink or title
-    """
-    target_dirs = get_target_directories(jekyll_dir, folders)
-
-    slug = ""
-    if live_url:
-        path = urlparse(live_url).path.rstrip("/")
-        if path:
-            slug = path.split("/")[-1].lower()
-
-    page_name_slug = re.sub(r"[^a-zA-Z0-9]+", "-", page_name.lower()).strip("-") if page_name else ""
-    search_slugs = [s for s in [slug, page_name_slug] if s]
-
-    if not search_slugs:
-        return None
-
-    # 1. Direct filename match in any target directory
-    for d in target_dirs:
-        for s in search_slugs:
-            candidate = os.path.join(d, f"{s}.md")
-            if os.path.isfile(candidate):
-                return candidate
-
-    # 2. Walk target directories: check filename substring
-    all_md_files = []
-    ignored_subdirs = {"_site", ".jekyll-cache", ".git", "node_modules", "vendor", ".antigravity", "assets"}
-    for d in target_dirs:
-        for root, _, files in os.walk(d):
-            if any(ignored in root for ignored in ignored_subdirs):
-                continue
-            for f in files:
-                if f.endswith(".md"):
-                    full_path = os.path.join(root, f)
-                    all_md_files.append(full_path)
-                    f_lower = f.lower()
-                    for s in search_slugs:
-                        if s in f_lower:
-                            return full_path
-
-    # 3. Check front matter permalink / title
-    for fpath in all_md_files:
-        try:
-            with open(fpath, "r", encoding="utf-8", errors="ignore") as fp:
-                head = fp.read(2048)
-
-            # Check permalink in frontmatter
-            m = re.search(r"permalink:\s*([^\s\n\r]+)", head, re.IGNORECASE)
-            if m:
-                permalink = m.group(1).strip().strip("\"'").rstrip("/").lower()
-                for s in search_slugs:
-                    if permalink.endswith(f"/{s}") or permalink == f"/{s}" or permalink == s:
-                        return fpath
-
-            # Check title in frontmatter
-            m_title = re.search(r"^title:\s*[\"']?(.*?)[\"']?$", head, re.MULTILINE | re.IGNORECASE)
-            if m_title and page_name:
-                if m_title.group(1).strip().lower() == page_name.strip().lower():
-                    return fpath
-        except Exception:
-            continue
-
-    return None
 
 # --- AGENT AUTOMATION WITH SESSION PERSISTENCE ---
 
@@ -518,46 +319,33 @@ def process_batch(
 
     try:
         while current_start <= total_rows:
-            if batch_size and batch_size > 0:
-                end_row = min(current_start + batch_size - 1, total_rows)
-            else:
-                end_row = total_rows
+            actionable_count = 0
+            empty_docs_skipped = 0
+            batch_target = batch_size if (batch_size and batch_size > 0) else None
 
+            target_desc = f"{batch_target} actionable pages" if batch_target else "all remaining rows"
             print("---\n" * 4)
-            print(f"\n🚀 Processing '{resolved_sheet}' - Rows {current_start} to {end_row} (Batch: {end_row - current_start + 1}, Total: {total_rows})...\n")
+            print(f"\n🚀 Processing '{resolved_sheet}' starting from Row {current_start} (Target: {target_desc}, Total Sheet Rows: {total_rows})...\n")
 
-            for row_idx in range(current_start - 1, end_row):
+            row_idx = current_start - 1
+            while row_idx < total_rows:
                 current_row_num = row_idx + 1
                 row = rows[row_idx]
 
                 if current_row_num in active_skip_rows:
+                    if empty_docs_skipped > 0:
+                        print(f"⏩ Skipped {empty_docs_skipped} row(s) without Google Doc links.")
+                        empty_docs_skipped = 0
                     print(f"⏩ [Row {current_row_num}] Skipped as configured in ROWS_TO_SKIP.")
                     update_progress(last_processed_row=current_row_num, next_row=current_row_num + 1, sheet_name=resolved_sheet, conversation_id=active_conv_id)
+                    row_idx += 1
                     continue
 
                 # Column layout for "Current Site Pages & New Site Pages":
-                # Col A (0): Category (e.g. Services & Other Pages)
-                # Col B (1): Old Site Pages (URL)
                 # Col C (2): Content Link (Google Doc URL)
-                # Col D (3): Status (Done)
-                # Col E (4): New Site Pages (Staging/Live URL)
-                # Col F (5): Jay Status
-                category = row[0] if len(row) > 0 else ""
                 old_url = row[1] if len(row) > 1 else ""
                 doc_col = row[2] if len(row) > 2 else ""
-                status = row[3] if len(row) > 3 else ""
                 new_url = row[4] if len(row) > 4 else ""
-                jay_status = row[5] if len(row) > 5 else ""
-
-                # Primary live URL is from New Site Pages (Col E), fallback to Old Site Pages (Col B)
-                live_link = new_url if (new_url and new_url.startswith("http")) else old_url
-
-                # Derive human-readable page name from slug
-                if live_link.startswith("http"):
-                    slug_part = urlparse(live_link).path.strip("/").split("/")[-1]
-                    page_name = slug_part.replace("-", " ").title() if slug_part else f"Row {current_row_num}"
-                else:
-                    page_name = old_url if old_url else f"Row {current_row_num}"
 
                 # Extract Google Doc ID from Column C (or scan any cell in row as fallback)
                 doc_id = extract_doc_id(doc_col)
@@ -567,25 +355,49 @@ def process_batch(
                         if doc_id:
                             break
 
+                # If no doc link is found, skip quietly in memory
                 if not doc_id:
-                    print(f"⏩ [Row {current_row_num}] {page_name}: No valid Google Doc found in Column C. Skipping.")
+                    empty_docs_skipped += 1
                     update_progress(last_processed_row=current_row_num, next_row=current_row_num + 1, sheet_name=resolved_sheet, conversation_id=active_conv_id)
+                    row_idx += 1
                     continue
 
-                print(f"--- Checking [Row {current_row_num}] {page_name} ---")
+                # Actionable row found
+                if empty_docs_skipped > 0:
+                    print(f"⏩ Skipped {empty_docs_skipped} row(s) without Google Doc links.")
+                    empty_docs_skipped = 0
+
+                actionable_count += 1
+                live_link = new_url if (new_url and new_url.startswith("http")) else old_url
+
+                # Derive human-readable page name from slug
+                if live_link.startswith("http"):
+                    slug_part = urlparse(live_link).path.strip("/").split("/")[-1]
+                    page_name = slug_part.replace("-", " ").title() if slug_part else f"Row {current_row_num}"
+                else:
+                    page_name = old_url if old_url else f"Row {current_row_num}"
+
+                batch_info = f"[{actionable_count}/{batch_target}] " if batch_target else ""
+                print(f"--- Checking {batch_info}[Row {current_row_num}] {page_name} ---")
 
                 # 1. Extract Links from Google Doc
                 doc_links, doc_md_text = get_doc_links_and_md(docs, drive, doc_id, live_url=live_link, old_url=old_url)
                 if not doc_links:
-                    print(f"ℹ️ No links found in Google Doc for '{page_name}'.")
+                    print(f"ℹ️ No links found in Google Doc for '{page_name}'.\n")
                     update_progress(last_processed_row=current_row_num, next_row=current_row_num + 1, sheet_name=resolved_sheet, conversation_id=active_conv_id)
+                    row_idx += 1
+                    if batch_target and actionable_count >= batch_target:
+                        break
                     continue
 
                 # 2. Find Local Jekyll File across configured content folders
                 local_file = find_matching_jekyll_file(page_name, live_link, jekyll_dir=jekyll_dir, folders=folders)
                 if not local_file:
-                    print(f"⚠️ Could not find local .md file for '{page_name}' (Slug: {urlparse(live_link).path}).")
+                    print(f"⚠️ Could not find local .md file for '{page_name}' (Slug: {urlparse(live_link).path}).\n")
                     update_progress(last_processed_row=current_row_num, next_row=current_row_num + 1, sheet_name=resolved_sheet, conversation_id=active_conv_id)
+                    row_idx += 1
+                    if batch_target and actionable_count >= batch_target:
+                        break
                     continue
 
                 # 3. Check for Missing Links
@@ -595,6 +407,9 @@ def process_batch(
                 if not missing_links:
                     print(f"✅ All {len(doc_links)} links are present in `{local_file}`.\n")
                     update_progress(last_processed_row=current_row_num, next_row=current_row_num + 1, sheet_name=resolved_sheet, conversation_id=active_conv_id)
+                    row_idx += 1
+                    if batch_target and actionable_count >= batch_target:
+                        break
                     continue
 
                 print(f"❌ Found {len(missing_links)} missing link(s):")
@@ -634,15 +449,21 @@ def process_batch(
                     conversation_id=active_conv_id
                 )
 
+                row_idx += 1
+                if batch_target and actionable_count >= batch_target:
+                    break
+
+            if empty_docs_skipped > 0:
+                print(f"⏩ Skipped {empty_docs_skipped} row(s) without Google Doc links.")
+
             # Check if all rows in sheet have been processed
-            if end_row >= total_rows:
+            if row_idx >= total_rows:
                 print(f"\n🎉 All {total_rows} rows in '{resolved_sheet}' have been processed!")
                 break
 
             # Prompt to continue to next batch (default: Y)
-            next_batch_start = end_row + 1
-            next_batch_end = min(next_batch_start + batch_size - 1, total_rows) if batch_size and batch_size > 0 else total_rows
-            action = input(f"Batch completed up to Row {end_row}. Continue to next batch (Rows {next_batch_start}-{next_batch_end})? [Y/n]: ").strip().lower()
+            next_batch_start = current_row_num + 1
+            action = input(f"Batch completed ({actionable_count} pages processed, reached Row {current_row_num}). Continue to next batch? [Y/n]: ").strip().lower()
             if action not in ["", "y", "yes"]:
                 print(f"💾 Progress saved. Next run will resume from Row {next_batch_start}.")
                 break

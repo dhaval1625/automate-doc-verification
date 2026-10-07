@@ -90,8 +90,8 @@ def normalize_text(text: str) -> str:
     text = text.replace("\u00a0", " ").replace("\ufeff", "")
     # Remove markdown headings but preserve C# and F#
     text = re.sub(r"(?<![cfCF])#+", " ", text)
-    # Remove markdown formatting characters
-    text = re.sub(r"[\*_`\\\->|]", " ", text)
+    # Remove markdown formatting characters and punctuation
+    text = re.sub(r"[\*_`\\\->|.,;:!?]", " ", text)
     # Collapse whitespace and lowercase
     text = re.sub(r"\s+", " ", text).strip().lower()
     return text
@@ -118,7 +118,7 @@ def match_titles(t1: str, t2: str) -> bool:
     return text_similarity(c1, c2) >= 0.85
 
 def text_similarity(a: str, b: str) -> float:
-    """Returns SequenceMatcher ratio between two normalized strings."""
+    """Returns SequenceMatcher ratio between two normalized strings without autojunk distortion."""
     na = normalize_text(a)
     nb = normalize_text(b)
     if not na and not nb:
@@ -127,7 +127,7 @@ def text_similarity(a: str, b: str) -> float:
         return 0.0
     if na == nb:
         return 1.0
-    return SequenceMatcher(None, na, nb).ratio()
+    return SequenceMatcher(None, na, nb, autojunk=False).ratio()
 
 def is_text_contained(needle: str, haystack: str, threshold: float = DEFAULT_SIMILARITY_THRESHOLD) -> bool:
     """Checks if normalized needle is present or highly similar within normalized haystack."""
@@ -154,12 +154,20 @@ def is_text_contained(needle: str, haystack: str, threshold: float = DEFAULT_SIM
 MAJOR_SECTIONS = [
     "project overview",
     "project objectives",
+    "project objective",
     "business challenges",
+    "business challenge",
+    "business problems",
+    "business problem",
     "our solutions",
+    "our solution",
     "key benefits",
+    "key benefit",
     "key features",
+    "key feature",
     "technology",
     "business results",
+    "business result",
     "frequently asked questions"
 ]
 
@@ -270,18 +278,29 @@ def parse_docs_api(doc: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
 
             # 4. Services
             if norm_p == "services" or norm_p.startswith("services:"):
-                collecting_services = True
-                continue
+                if "\x0b" in clean_raw_text:
+                    parts = [re.sub(r"[\*#_]", "", pt).strip() for pt in clean_raw_text.split("\x0b") if pt.strip()]
+                    for pt in parts[1:]:
+                        data["services"].append(pt)
+                    collecting_services = False
+                    continue
+                else:
+                    collecting_services = True
+                    continue
             elif collecting_services:
-                if norm_p.startswith("country:") or any(norm_p == ms for ms in MAJOR_SECTIONS) or any(norm_p.startswith(f) for f in ["industry:", "project name:", "short description:"]):
+                if norm_p.startswith(("country:", "country/region:", "country / region:", "region:")) or any(norm_p == ms for ms in MAJOR_SECTIONS) or any(norm_p.startswith(f) for f in ["industry:", "project name:", "short description:"]):
                     collecting_services = False
                 else:
                     data["services"].append(re.sub(r"[\*#_]", "", p_text.lstrip("*- ")).strip())
                     continue
 
             # 5. Country
-            if norm_p.startswith("country:"):
+            if norm_p.startswith(("country:", "country/region:", "country / region:", "region:")):
                 data["country"] = re.sub(r"[\*#_]", "", p_text.split(":", 1)[-1]).strip()
+                continue
+
+            if norm_p in ["product gallery"]:
+                current_sec = None
                 continue
 
             # 6. Major Sections
@@ -292,7 +311,9 @@ def parse_docs_api(doc: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
                     break
 
             if matched_major:
-                clean_title = clean_raw_text
+                clean_title = clean_raw_text.replace("\x0b", " ").strip()
+                if current_sec and current_sec["title"].lower() == clean_title.lower():
+                    continue
                 current_sec = {
                     "title": clean_title,
                     "items": [],
@@ -330,6 +351,15 @@ def parse_docs_api(doc: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
                         "text": m_res.group(2).strip(),
                         "subtext": ""
                     })
+                elif "HEADING" in style or (style == "NORMAL_TEXT" and is_all_bold and len(clean_raw_text.split()) <= 6):
+                    words = clean_raw_text.split()
+                    val = words[0] if words else ""
+                    txt = " ".join(words[1:]) if len(words) > 1 else clean_raw_text
+                    current_sec["items"].append({
+                        "value": val,
+                        "text": txt,
+                        "subtext": ""
+                    })
                 elif current_sec["items"] and isinstance(current_sec["items"][-1], dict) and "subtext" in current_sec["items"][-1]:
                     if current_sec["items"][-1]["subtext"]:
                         current_sec["items"][-1]["subtext"] += " " + clean_raw_text
@@ -337,8 +367,8 @@ def parse_docs_api(doc: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
                         current_sec["items"][-1]["subtext"] = clean_raw_text
                 continue
 
-            # Key Features or Challenges
-            if "feature" in sec_name or "challenge" in sec_name:
+            # Key Features or Challenges / Problems
+            if "feature" in sec_name or "challenge" in sec_name or "problem" in sec_name:
                 # Check 1: Inline bold title + description
                 clean_b = bold_text.replace("\x0b", " ").strip()
                 clean_nb = non_bold_text.replace("\x0b", " ").strip()
@@ -464,14 +494,21 @@ def parse_doc_content(doc_text: str) -> Dict[str, Any]:
             continue
 
         # 4. Country
-        m_country = re.search(r"country\s*:\s*(.*)", line, re.IGNORECASE)
+        m_country = re.search(r"(?:country|country/region|region)\s*:\s*(.*)", line, re.IGNORECASE)
         if m_country and not data["country"]:
             data["country"] = re.sub(r"[\*#_]", "", m_country.group(1)).strip()
             continue
 
         # 5. Services header
         if re.search(r"^Services\s*:", line, re.IGNORECASE):
-            collecting_services = True
+            s_tail = re.sub(r"[\*#_]", "", re.sub(r"^#*\s*\*{0,2}Services\s*:\s*\*{0,2}", "", line, flags=re.IGNORECASE)).strip()
+            if s_tail:
+                parts = [p.strip() for p in re.split(r"\s{2,}|\t|\x0b", s_tail) if p.strip()]
+                for pt in parts:
+                    data["services"].append(pt)
+                collecting_services = False
+            else:
+                collecting_services = True
             continue
 
         if collecting_services:
@@ -480,26 +517,18 @@ def parse_doc_content(doc_text: str) -> Dict[str, Any]:
                 if item:
                     data["services"].append(item)
                 continue
+            elif re.search(r"(?:country|industry)\s*:", line, re.IGNORECASE) or any(norm_line.startswith(ms) for ms in MAJOR_SECTIONS):
+                collecting_services = False
             else:
                 collecting_services = False
 
         # 6. Check for Major Section Headings
-        # Check if line is a sub-metric in Business Results (e.g. ### **35% Faster...**)
-        clean_metric_cand = re.sub(r"^[#\*\s]+|[#\*\s]+$", "", line)
-        m_metric = re.match(r"^(\d+%\+?)\s*(.+)$", clean_metric_cand)
-        if current_section and "business results" in current_section["title"].lower() and m_metric:
-            val = m_metric.group(1).strip()
-            txt = re.sub(r"[\*#_]", "", m_metric.group(2)).strip()
-            current_section["items"].append({
-                "value": val,
-                "text": txt,
-                "subtext": ""
-            })
-            continue
-
-        # Headings for Major Sections
         clean_head_cand = re.sub(r"[\*#_]", "", line).strip()
         norm_head = clean_head_cand.lower()
+        if norm_head in ["product gallery"]:
+            current_section = None
+            continue
+
         matched_ms = None
         for ms in MAJOR_SECTIONS:
             if norm_head == ms or (norm_head.startswith(ms) and len(norm_head.split()) <= 4):
@@ -517,6 +546,30 @@ def parse_doc_content(doc_text: str) -> Dict[str, Any]:
             }
             data["sections"].append(current_section)
             continue
+
+        # Check if line is a sub-metric in Business Results (e.g. ### **35% Faster...** or ### **Improved Customer Experience**)
+        clean_metric_cand = re.sub(r"^[#\*\s]+|[#\*\s]+$", "", line)
+        m_metric = re.match(r"^(\d+%\+?)\s*(.+)$", clean_metric_cand)
+        if current_section and "business results" in current_section["title"].lower():
+            if m_metric:
+                val = m_metric.group(1).strip()
+                txt = re.sub(r"[\*#_]", "", m_metric.group(2)).strip()
+                current_section["items"].append({
+                    "value": val,
+                    "text": txt,
+                    "subtext": ""
+                })
+                continue
+            elif (line.startswith("### ") or line.startswith("## ") or re.match(r"^\*\*[A-Z].+\*\*$", line)) and len(clean_metric_cand.split()) <= 6:
+                words = clean_metric_cand.split()
+                val = words[0] if words else ""
+                txt = " ".join(words[1:]) if len(words) > 1 else clean_metric_cand
+                current_section["items"].append({
+                    "value": val,
+                    "text": txt,
+                    "subtext": ""
+                })
+                continue
 
         if not current_section:
             # Intro text before any explicit heading
@@ -685,23 +738,33 @@ def compare_content(
                 "message": f"Title mismatch. Expected: '{doc_data['title']}' | Found: '{j_title}'"
             })
 
-    # Banner Description check
+    # Banner Description / Short Description check
     if doc_data.get("banner_description"):
         total_checks += 1
-        j_desc = str(jekyll_data.get("banner_description", "") or jekyll_data.get("description", ""))
+        j_bdesc = str(jekyll_data.get("banner_description", "")).strip()
+        j_desc = str(jekyll_data.get("description", "")).strip()
+
         norm_d = normalize_text(doc_data["banner_description"])
-        norm_j = normalize_text(j_desc)
-        sim = text_similarity(norm_d, norm_j)
-        if norm_d == norm_j or sim >= 0.85:
+        norm_jb = normalize_text(j_bdesc)
+        norm_jd = normalize_text(j_desc)
+
+        sim_b = text_similarity(norm_d, norm_jb) if norm_jb else 0.0
+        sim_d = text_similarity(norm_d, norm_jd) if norm_jd else 0.0
+
+        if norm_d == norm_jb or sim_b >= 0.85 or (norm_jb and (norm_d in norm_jb or norm_jb in norm_d)):
             passed_checks += 1
             success_items.append("Banner description matched")
+        elif norm_d == norm_jd or sim_d >= 0.85 or (norm_jd and (norm_d in norm_jd or norm_jd in norm_d)):
+            passed_checks += 1
+            success_items.append("Description matched")
         else:
+            found_desc = j_bdesc or j_desc
             discrepancies.append({
                 "type": "METADATA_MISMATCH",
                 "field": "banner_description",
                 "expected": doc_data["banner_description"][:80] + "...",
-                "found": j_desc[:80] + "...",
-                "message": f"Banner description mismatch. Expected: '{doc_data['banner_description'][:80]}...' | Found: '{j_desc[:80]}...'"
+                "found": found_desc[:80] + "...",
+                "message": f"Banner description mismatch. Expected: '{doc_data['banner_description'][:80]}...' | Found: '{found_desc[:80]}...'"
             })
 
     # Industry check
@@ -809,6 +872,14 @@ def compare_content(
         if not matched_j_sec and "benefit" in norm_title:
             for j_idx, s in enumerate(j_sections):
                 if isinstance(s, dict) and "solution" in normalize_text(str(s.get("title", ""))):
+                    matched_j_sec = s
+                    matched_j_idx = j_idx
+                    break
+
+        # Special case: Business Problems vs Business Challenges
+        if not matched_j_sec and ("problem" in norm_title or "challenge" in norm_title):
+            for j_idx, s in enumerate(j_sections):
+                if isinstance(s, dict) and any(k in normalize_text(str(s.get("title", ""))) for k in ["challenge", "problem"]):
                     matched_j_sec = s
                     matched_j_idx = j_idx
                     break
@@ -1298,8 +1369,11 @@ def assign_agent_content_task(
         f"3. Maintain proper Jekyll YAML structure (e.g. sections list with type, title, items, content, rows).\n"
         f"4. Preserve existing root-relative internal links or convert URLs to root-relative paths like /service-name.\n"
         f"5. Apply the edits directly to {local_file}.\n"
-        f"6. IMPORTANT OUTPUT RULE: When finished, respond ONLY with the exact single line below and NOTHING else:\n"
-        f"All content discrepancies have been resolved in {local_file}."
+        f"6. IMPORTANT OUTPUT RULE: When finished, respond with:\n"
+        f"   - If you made edits to resolve discrepancies, respond with:\n"
+        f"     All content discrepancies have been resolved in {local_file}.\n"
+        f"   - If any reported discrepancies were fake / false alarms (the content is already present at the right place), respond with:\n"
+        f"     ALREADY_PRESENT: <brief explanation of which reported items are already correctly present at the right place>\n"
     )
 
     agy_bin = shutil.which("agy")
@@ -1354,7 +1428,18 @@ def assign_agent_content_task(
                 detected_conv_id = get_latest_agy_conversation_id()
 
             if success:
-                print(f"✅ Agent applied edits to {local_file}.\n")
+                full_text = "".join(full_output)
+                already_present_match = re.search(r"ALREADY_PRESENT:\s*(.+?)(?=\n[A-Z0-9_]+:|\Z)", full_text, re.IGNORECASE | re.DOTALL)
+                has_resolved = bool(re.search(r"All content discrepancies have been resolved", full_text, re.IGNORECASE))
+                if already_present_match:
+                    info = already_present_match.group(1).strip()
+                    print(f"ℹ️ Agent reported discrepancies already present at right place:\n   {info}")
+                    if has_resolved:
+                        print(f"✅ Agent applied remaining edits to {local_file}.\n")
+                    else:
+                        print()
+                else:
+                    print(f"✅ Agent applied edits to {local_file}.\n")
             else:
                 print(f"⚠️ Agent process completed with returncode non-zero.")
                 tail = "".join(full_output[-10:])
@@ -1388,7 +1473,8 @@ def process_batch(
     agent_mode: str = "auto",
     conversation_id: Optional[str] = None,
     skip_rows: Optional[List[int]] = None,
-    threshold: float = DEFAULT_SIMILARITY_THRESHOLD
+    threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+    max_row: Optional[int] = LAST_ROW_TO_CHECK,
 ):
     state = load_progress()
     active_skip_rows = set(skip_rows if skip_rows is not None else ROWS_TO_SKIP)
@@ -1420,25 +1506,31 @@ def process_batch(
     rows = result.get("values", [])
 
     total_rows = len(rows)
+    effective_max_row = min(total_rows, max_row) if (max_row and max_row > 0) else total_rows
+
     if start_row > total_rows:
         print(f"⚠️ Start row {start_row} is greater than total rows ({total_rows}) in sheet '{resolved_sheet}'.")
+        return
+
+    if max_row and start_row > max_row:
+        print(f"⚠️ Start row {start_row} is past configured LAST_ROW_TO_CHECK ({max_row}). Stopping verification.")
         return
 
     current_start = start_row
     current_row_num = start_row
 
     try:
-        while current_start <= total_rows:
+        while current_start <= effective_max_row:
             actionable_count = 0
             empty_docs_skipped = 0
             batch_target = batch_size if (batch_size and batch_size > 0) else None
 
             target_desc = f"{batch_target} actionable pages" if batch_target else "all remaining rows"
             print("---\n" * 4)
-            print(f"\n🚀 Processing '{resolved_sheet}' starting from Row {current_start} (Target: {target_desc}, Total Sheet Rows: {total_rows})...\n")
+            print(f"\n🚀 Processing '{resolved_sheet}' starting from Row {current_start} (Target: {target_desc}, Total Sheet Rows: {total_rows}, Max Row: {effective_max_row})...\n")
 
             row_idx = current_start - 1
-            while row_idx < total_rows:
+            while row_idx < effective_max_row:
                 current_row_num = row_idx + 1
                 row = rows[row_idx]
 
@@ -1584,11 +1676,21 @@ def process_batch(
             if empty_docs_skipped > 0:
                 print(f"⏩ Skipped {empty_docs_skipped} row(s) without Google Doc links.")
 
-            if row_idx >= total_rows:
-                print(f"\n🎉 All {total_rows} rows in '{resolved_sheet}' have been processed!")
+            if row_idx >= effective_max_row or current_row_num >= effective_max_row:
+                if effective_max_row < total_rows:
+                    print(f"\n🎉 Reached configured LAST_ROW_TO_CHECK (Row {effective_max_row}). Stopping verification!")
+                else:
+                    print(f"\n🎉 All {total_rows} rows in '{resolved_sheet}' have been processed!")
                 break
 
             next_batch_start = current_row_num + 1
+            if next_batch_start > effective_max_row:
+                if effective_max_row < total_rows:
+                    print(f"\n🎉 Next row ({next_batch_start}) exceeds configured LAST_ROW_TO_CHECK ({effective_max_row}). Stopping verification!")
+                else:
+                    print(f"\n🎉 All {total_rows} rows in '{resolved_sheet}' have been processed!")
+                break
+
             action = input(f"Batch completed ({actionable_count} pages processed, reached Row {current_row_num}). Continue to next batch? [Y/n]: ").strip().lower()
             if action not in ["", "y", "yes"]:
                 print(f"💾 Progress saved. Next run will resume from Row {next_batch_start}.")
@@ -1612,6 +1714,7 @@ if __name__ == "__main__":
     parser.add_argument("--sheet", type=str, default=DEFAULT_SHEET_NAME, help=f"Sheet/tab name to process (default: '{DEFAULT_SHEET_NAME}')")
     parser.add_argument("--start", type=int, default=None, help=f"Starting row number (default: resume from {PROGRESS_FILE} or {DEFAULT_START_ROW})")
     parser.add_argument("--batch", type=int, default=DEFAULT_BATCH_SIZE, help="Batch size (number of actionable rows to process; 0 for all remaining)")
+    parser.add_argument("--max-row", type=int, default=LAST_ROW_TO_CHECK, help=f"Maximum row number to check (default: {LAST_ROW_TO_CHECK})")
     parser.add_argument("--jekyll-dir", type=str, default=JEKYLL_PROJECT_DIR, help="Absolute path to Jekyll project directory")
     parser.add_argument("--folders", nargs="+", default=CONTENT_FOLDERS, help="Content folders to scan (e.g. _services _technologies _work)")
     parser.add_argument(
@@ -1640,5 +1743,6 @@ if __name__ == "__main__":
         agent_mode=args.agent_mode,
         conversation_id=args.conversation if not args.new_session else "",
         skip_rows=args.skip_rows,
-        threshold=args.threshold
+        threshold=args.threshold,
+        max_row=args.max_row,
     )

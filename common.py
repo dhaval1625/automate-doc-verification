@@ -3,10 +3,6 @@ import re
 import sys
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
 
 # Ensure UTF-8 output encoding across Windows terminals
 if hasattr(sys.stdout, "reconfigure"):
@@ -74,6 +70,11 @@ def get_latest_agy_conversation_id() -> Optional[str]:
 
 def get_services():
     """Authenticates and initializes Google Sheets, Drive, and Docs client services."""
+    from googleapiclient.discovery import build
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+
     creds = None
     if os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)

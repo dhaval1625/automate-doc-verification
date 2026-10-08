@@ -159,6 +159,9 @@ MAJOR_SECTIONS = [
     "business challenge",
     "business problems",
     "business problem",
+    "the challenge",
+    "challenges",
+    "challenge",
     "our solutions",
     "our solution",
     "key benefits",
@@ -331,6 +334,12 @@ def parse_docs_api(doc: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
 
             # FAQs
             if "faq" in sec_name or "frequently asked" in sec_name:
+                if bold_text and non_bold_text and ("?" in bold_text or re.match(r"^\d+[\)\.]", bold_text)):
+                    clean_q = re.sub(r"[\*#_]", "", bold_text).strip()
+                    clean_q = re.sub(r"^\d+[\)\.]\s*", "", clean_q).strip()
+                    clean_a = re.sub(r"[\*#_]", "", non_bold_text).strip()
+                    current_sec["faqs"].append({"question": clean_q, "answer": clean_a})
+                    continue
                 m_q = re.match(r"^\d+[\)\.]\s*(.+)$", clean_raw_text)
                 if m_q or clean_raw_text.endswith("?"):
                     q_text = m_q.group(1).strip() if m_q else clean_raw_text
@@ -351,7 +360,7 @@ def parse_docs_api(doc: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
                         "text": m_res.group(2).strip(),
                         "subtext": ""
                     })
-                elif "HEADING" in style or (style == "NORMAL_TEXT" and is_all_bold and len(clean_raw_text.split()) <= 6):
+                elif ("HEADING" in style or (style == "NORMAL_TEXT" and is_all_bold)) and len(clean_raw_text.split()) <= 6:
                     words = clean_raw_text.split()
                     val = words[0] if words else ""
                     txt = " ".join(words[1:]) if len(words) > 1 else clean_raw_text
@@ -531,7 +540,7 @@ def parse_doc_content(doc_text: str) -> Dict[str, Any]:
 
         matched_ms = None
         for ms in MAJOR_SECTIONS:
-            if norm_head == ms or (norm_head.startswith(ms) and len(norm_head.split()) <= 4):
+            if norm_head == ms or (norm_head.startswith(ms) and (line.startswith("#") or len(norm_head.split()) <= 4)):
                 matched_ms = ms
                 break
 
@@ -580,8 +589,17 @@ def parse_doc_content(doc_text: str) -> Dict[str, Any]:
         sec_name = current_section["title"].lower()
 
         # 7. FAQs parsing: **1) Question?** \n Answer
-        m_faq = re.match(r"^\*{0,2}\d+[\)\.]\s*(.+?)\*{0,2}$", line)
         if "faq" in sec_name or "frequently asked questions" in sec_name:
+            m_faq_inline = re.match(r"^\*{0,2}\d+[\)\.]\s*(.+?\?)\*{0,2}\s*(.*)$", line)
+            if m_faq_inline and m_faq_inline.group(2).strip():
+                q_text = m_faq_inline.group(1).strip()
+                a_text = m_faq_inline.group(2).strip()
+                current_section["faqs"].append({
+                    "question": q_text,
+                    "answer": a_text
+                })
+                continue
+            m_faq = re.match(r"^\*{0,2}\d+[\)\.]\s*(.+?)\*{0,2}$", line)
             if m_faq:
                 q_text = m_faq.group(1).strip()
                 current_section["faqs"].append({
@@ -641,7 +659,7 @@ def parse_doc_content(doc_text: str) -> Dict[str, Any]:
                     })
                     continue
 
-            m_item_title = re.match(r"^(?:#{1,4}\s*)?\*{0,2}(?:\d+[\.\)]\s*)?([A-Z0-9][A-Za-z0-9\s&/\-]+)\*{0,2}$", line)
+            m_item_title = re.match(r"^(?:#{1,4}\s*)?(?:[\*\-]\s*)?\*{0,2}(?:\d+[\.\)]\s*)?([A-Z0-9][A-Za-z0-9\s&/\-'’]+)\*{0,2}$", line)
             if m_item_title and len(m_item_title.group(1).split()) <= 8:
                 current_section["items"].append({
                     "title": m_item_title.group(1).strip(),
@@ -1270,6 +1288,10 @@ def compare_content(
                     d_b_norm = normalize_text(d_bullet)
                     pos = norm_j_raw.find(d_b_norm)
                     if pos != -1:
+                        if pos < last_pos:
+                            next_pos = norm_j_raw.find(d_b_norm, last_pos)
+                            if next_pos != -1:
+                                pos = next_pos
                         total_checks += 1
                         if pos < last_pos:
                             discrepancies.append({
